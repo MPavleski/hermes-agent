@@ -984,6 +984,28 @@ def _build_compact_banner() -> str:
 
 
 # ============================================================================
+# Slash-command detection helper
+# ============================================================================
+
+def _looks_like_slash_command(text: str) -> bool:
+    """Return True if *text* looks like a slash command, not a file path.
+
+    Slash commands are ``/help``, ``/model gpt-4``, ``/q``, etc.
+    File paths like ``/Users/ironin/file.md:45-46 can you fix this?``
+    also start with ``/`` but contain additional ``/`` characters in
+    the first whitespace-delimited word.  This helper distinguishes
+    the two so that pasted paths are sent to the agent instead of
+    triggering "Unknown command".
+    """
+    if not text or not text.startswith("/"):
+        return False
+    first_word = text.split()[0]
+    # After stripping the leading /, a command name has no slashes.
+    # A path like /Users/foo/bar.md always does.
+    return "/" not in first_word[1:]
+
+
+# ============================================================================
 # Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
 
@@ -2166,6 +2188,7 @@ class HermesCLI:
                 return False
             restored = self._session_db.get_messages_as_conversation(self.session_id)
             if restored:
+                restored = [m for m in restored if m.get("role") != "session_meta"]
                 self.conversation_history = restored
                 msg_count = len([m for m in restored if m.get("role") == "user"])
                 title_part = ""
@@ -2361,6 +2384,7 @@ class HermesCLI:
 
         restored = self._session_db.get_messages_as_conversation(self.session_id)
         if restored:
+            restored = [m for m in restored if m.get("role") != "session_meta"]
             self.conversation_history = restored
             msg_count = len([m for m in restored if m.get("role") == "user"])
             title_part = ""
@@ -3259,9 +3283,10 @@ class HermesCLI:
         self._resumed = True
         self._pending_title = None
 
-        # Load conversation history
+        # Load conversation history (strip transcript-only metadata entries)
         restored = self._session_db.get_messages_as_conversation(target_id)
-        self.conversation_history = restored or []
+        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        self.conversation_history = restored
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -6263,8 +6288,11 @@ class HermesCLI:
                 ).start()
 
 
-            # Combine all interrupt messages (user may have typed multiple while waiting)
-            # and re-queue as one prompt for process_loop
+            # Re-queue the interrupt message (and any that arrived while we were
+            # processing the first) as the next prompt for process_loop.
+            # Only reached when busy_input_mode == "interrupt" (the default).
+            # In "queue" mode Enter routes directly to _pending_input so this
+            # block is never hit.
             if pending_message and hasattr(self, '_pending_input'):
                 all_parts = [pending_message]
                 while not self._interrupt_queue.empty():
@@ -6275,7 +6303,12 @@ class HermesCLI:
                     except queue.Empty:
                         break
                 combined = "\n".join(all_parts)
-                print(f"\n📨 Queued: '{combined[:50]}{'...' if len(combined) > 50 else ''}'")
+                n = len(all_parts)
+                preview = combined[:50] + ("..." if len(combined) > 50 else "")
+                if n > 1:
+                    print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
+                else:
+                    print(f"\n⚡ Sending after interrupt: '{preview}'")
                 self._pending_input.put(combined)
             
             return response
@@ -6701,7 +6734,7 @@ class HermesCLI:
                 event.app.invalidate()
                 # Bundle text + images as a tuple when images are present
                 payload = (text, images) if images else text
-                if self._agent_running and not (text and text.startswith("/")):
+                if self._agent_running and not (text and _looks_like_slash_command(text)):
                     if self.busy_input_mode == "queue":
                         # Queue for the next turn instead of interrupting
                         self._pending_input.put(payload)
@@ -7010,6 +7043,9 @@ class HermesCLI:
             buffer.
             """
             pasted_text = event.data or ""
+            # Normalise line endings — Windows \r\n and old Mac \r both become \n
+            # so the 5-line collapse threshold and display are consistent.
+            pasted_text = pasted_text.replace('\r\n', '\n').replace('\r', '\n')
             if self._try_attach_clipboard_image():
                 event.app.invalidate()
             if pasted_text:
@@ -7682,7 +7718,7 @@ class HermesCLI:
                                 + (f"\n{_remainder}" if _remainder else "")
                             )
 
-                    if not _file_drop and isinstance(user_input, str) and user_input.startswith("/"):
+                    if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
                         _cprint(f"\n⚙️  {user_input}")
                         if not self.process_command(user_input):
                             self._should_exit = True
