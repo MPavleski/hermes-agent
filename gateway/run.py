@@ -1127,6 +1127,7 @@ class GatewayRunner:
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+            adapter.set_session_store(self.session_store)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -1424,6 +1425,7 @@ class GatewayRunner:
 
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+                    adapter.set_session_store(self.session_store)
 
                     success = await adapter.connect()
                     if success:
@@ -3244,7 +3246,7 @@ class GatewayRunner:
             old_entry = self.session_store._entries.get(session_key)
             if old_entry:
                 _flush_task = asyncio.create_task(
-                    self._async_flush_memories(old_entry.session_id, session_key)
+                    self._async_flush_memories(old_entry.session_id)
                 )
                 self._background_tasks.add(_flush_task)
                 _flush_task.add_done_callback(self._background_tasks.discard)
@@ -4990,7 +4992,7 @@ class GatewayRunner:
         # Flush memories for current session before switching
         try:
             _flush_task = asyncio.create_task(
-                self._async_flush_memories(current_entry.session_id, session_key)
+                self._async_flush_memories(current_entry.session_id)
             )
             self._background_tasks.add(_flush_task)
             _flush_task.add_done_callback(self._background_tasks.discard)
