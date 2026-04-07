@@ -260,10 +260,43 @@ class _CodexCompletionsAdapter:
         usage = None
 
         try:
+            # Collect output items and text deltas during streaming —
+            # the Codex backend can return empty response.output from
+            # get_final_response() even when items were streamed.
+            collected_output_items: List[Any] = []
+            collected_text_deltas: List[str] = []
             with self._client.responses.stream(**resp_kwargs) as stream:
                 for _event in stream:
-                    pass
+                    _etype = getattr(_event, "type", "")
+                    if _etype == "response.output_item.done":
+                        _done = getattr(_event, "item", None)
+                        if _done is not None:
+                            collected_output_items.append(_done)
+                    elif "output_text.delta" in _etype:
+                        _delta = getattr(_event, "delta", "")
+                        if _delta:
+                            collected_text_deltas.append(_delta)
                 final = stream.get_final_response()
+
+            # Backfill empty output from collected stream events
+            _output = getattr(final, "output", None)
+            if isinstance(_output, list) and not _output:
+                if collected_output_items:
+                    final.output = list(collected_output_items)
+                    logger.debug(
+                        "Codex auxiliary: backfilled %d output items from stream events",
+                        len(collected_output_items),
+                    )
+                elif collected_text_deltas:
+                    assembled = "".join(collected_text_deltas)
+                    final.output = [SimpleNamespace(
+                        type="message", role="assistant", status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )]
+                    logger.debug(
+                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
+                        len(collected_text_deltas), len(assembled),
+                    )
 
             # Extract text and tool calls from the Responses output
             for item in getattr(final, "output", []):
@@ -849,7 +882,7 @@ def _resolve_forced_provider(forced: str) -> Tuple[Optional[OpenAI], Optional[st
     if forced == "nous":
         client, model = _try_nous()
         if client is None:
-            logger.warning("auxiliary.provider=nous but Nous Portal not configured (run: hermes login)")
+            logger.warning("auxiliary.provider=nous but Nous Portal not configured (run: hermes auth)")
         return client, model
 
     if forced == "codex":
@@ -1119,7 +1152,7 @@ def resolve_provider_client(
         client, default = _try_nous()
         if client is None:
             logger.warning("resolve_provider_client: nous requested "
-                           "but Nous Portal not configured (run: hermes login)")
+                           "but Nous Portal not configured (run: hermes auth)")
             return None, None
         final_model = model or default
         return (_to_async_client(client, final_model) if async_mode
