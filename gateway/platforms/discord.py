@@ -49,6 +49,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     cache_image_from_url,
     cache_audio_from_url,
@@ -754,14 +755,17 @@ class DiscordAdapter(BasePlatformAdapter):
         if hasattr(message, "add_reaction"):
             await self._add_reaction(message, "👀")
 
-    async def on_processing_complete(self, event: MessageEvent, success: bool) -> None:
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
         message = event.raw_message
         if hasattr(message, "add_reaction"):
             await self._remove_reaction(message, "👀")
-            await self._add_reaction(message, "✅" if success else "❌")
+            if outcome == ProcessingOutcome.SUCCESS:
+                await self._add_reaction(message, "✅")
+            elif outcome == ProcessingOutcome.FAILURE:
+                await self._add_reaction(message, "❌")
 
     async def send(
         self,
@@ -1888,13 +1892,41 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
         )
 
+        _parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
+        _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=interaction,
+            auto_skill=_skills,
         )
         await self.handle_message(event)
+
+    def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
+        """Look up auto-skill bindings for a Discord channel/forum thread.
+
+        Config format (in platform extra):
+            channel_skill_bindings:
+              - id: "123456"
+                skills: ["skill-a", "skill-b"]
+        Also checks parent_id so forum threads inherit the forum's bindings.
+        """
+        bindings = self.config.extra.get("channel_skill_bindings", [])
+        if not bindings:
+            return None
+        ids_to_check = {channel_id}
+        if parent_id:
+            ids_to_check.add(parent_id)
+        for entry in bindings:
+            entry_id = str(entry.get("id", ""))
+            if entry_id in ids_to_check:
+                skills = entry.get("skills") or entry.get("skill")
+                if isinstance(skills, str):
+                    return [skills]
+                if isinstance(skills, list) and skills:
+                    return list(dict.fromkeys(skills))  # dedup, preserve order
+        return None
 
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
@@ -2480,6 +2512,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if not event_text or not event_text.strip():
             event_text = "(The user sent a message with no text content)"
 
+        _chan = message.channel
+        _parent_id = str(getattr(_chan, "parent_id", "") or "")
+        _chan_id = str(getattr(_chan, "id", ""))
+        _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,
@@ -2490,6 +2526,7 @@ class DiscordAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=str(message.reference.message_id) if message.reference else None,
             timestamp=message.created_at,
+            auto_skill=_skills,
         )
 
         # Track thread participation so the bot won't require @mention for
