@@ -234,6 +234,63 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "kickstart", target],
         ]
 
+    def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
+        """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+
+        gateway_cli.launchd_stop()
+
+        assert calls == [["launchctl", "bootout", target]]
+
+    def test_launchd_stop_tolerates_already_unloaded(self, monkeypatch, capsys):
+        """launchd_stop silently handles exit codes 3/113 (job not loaded)."""
+        label = gateway_cli.get_launchd_label()
+        domain = gateway_cli._launchd_domain()
+        target = f"{domain}/{label}"
+
+        def fake_run(cmd, check=False, **kwargs):
+            if "bootout" in cmd:
+                raise gateway_cli.subprocess.CalledProcessError(3, cmd, stderr="Could not find service")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kw: None)
+
+        # Should not raise — exit code 3 means already unloaded
+        gateway_cli.launchd_stop()
+
+        output = capsys.readouterr().out
+        assert "stopped" in output.lower()
+
+    def test_launchd_stop_waits_for_process_exit(self, monkeypatch):
+        """launchd_stop calls _wait_for_gateway_exit after bootout."""
+        wait_called = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def fake_wait(**kwargs):
+            wait_called.append(kwargs)
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", fake_wait)
+
+        gateway_cli.launchd_stop()
+
+        assert len(wait_called) == 1
+        assert wait_called[0] == {"timeout": 10.0, "force_after": 5.0}
+
     def test_launchd_status_reports_local_stale_plist_when_unloaded(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
@@ -698,6 +755,7 @@ class TestProfileArg:
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         result = gateway_cli._profile_arg(str(hermes_home))
         assert result == ""
 
@@ -706,6 +764,7 @@ class TestProfileArg:
         profile_dir = tmp_path / ".hermes" / "profiles" / "mybot"
         profile_dir.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         result = gateway_cli._profile_arg(str(profile_dir))
         assert result == "--profile mybot"
 
@@ -714,6 +773,7 @@ class TestProfileArg:
         custom_home = tmp_path / "custom" / "hermes"
         custom_home.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         result = gateway_cli._profile_arg(str(custom_home))
         assert result == ""
 
@@ -722,6 +782,7 @@ class TestProfileArg:
         nested = tmp_path / ".hermes" / "profiles" / "mybot" / "subdir"
         nested.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         result = gateway_cli._profile_arg(str(nested))
         assert result == ""
 
@@ -730,6 +791,7 @@ class TestProfileArg:
         bad_profile = tmp_path / ".hermes" / "profiles" / "My Bot!"
         bad_profile.mkdir(parents=True)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         result = gateway_cli._profile_arg(str(bad_profile))
         assert result == ""
 
