@@ -1748,10 +1748,25 @@ class AIAgent:
 
             aux_base_url = str(getattr(client, "base_url", ""))
             aux_api_key = str(getattr(client, "api_key", ""))
+
+            # Read user-configured context_length for the compression model.
+            # Custom endpoints often don't support /models API queries so
+            # get_model_context_length() falls through to the 128K default,
+            # ignoring the explicit config value.  Pass it as the highest-
+            # priority hint so the configured value is always respected.
+            _aux_cfg = (self.config or {}).get("auxiliary", {}).get("compression", {})
+            _aux_context_config = _aux_cfg.get("context_length") if isinstance(_aux_cfg, dict) else None
+            if _aux_context_config is not None:
+                try:
+                    _aux_context_config = int(_aux_context_config)
+                except (TypeError, ValueError):
+                    _aux_context_config = None
+
             aux_context = get_model_context_length(
                 aux_model,
                 base_url=aux_base_url,
                 api_key=aux_api_key,
+                config_context_length=_aux_context_config,
             )
 
             threshold = self.context_compressor.threshold_tokens
@@ -5841,11 +5856,12 @@ class AIAgent:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
         MiniMax keeps dots (e.g. MiniMax-M2.7).
-        OpenCode Go keeps dots (e.g. minimax-m2.7)."""
-        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "minimax", "minimax-cn", "opencode-go"}:
+        OpenCode Go/Zen keeps dots for non-Claude models (e.g. minimax-m2.5-free).
+        ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1)."""
+        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "minimax", "minimax-cn", "opencode-go", "opencode-zen", "zai"}:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base or "minimax" in base or "opencode.ai/zen/go" in base
+        return "dashscope" in base or "aliyuncs" in base or "minimax" in base or "opencode.ai/zen/" in base or "bigmodel.cn" in base
 
     def _is_qwen_portal(self) -> bool:
         """Return True when the base URL targets Qwen Portal."""
@@ -9736,12 +9752,25 @@ class AIAgent:
                     
                     # Pop thinking-only prefill message(s) before appending
                     # (tool-call path — same rationale as the final-response path).
+                    _had_prefill = False
                     while (
                         messages
                         and isinstance(messages[-1], dict)
                         and messages[-1].get("_thinking_prefill")
                     ):
                         messages.pop()
+                        _had_prefill = True
+
+                    # Reset prefill counter when tool calls follow a prefill
+                    # recovery.  Without this, the counter accumulates across
+                    # the whole conversation — a model that intermittently
+                    # empties (empty → prefill → tools → empty → prefill →
+                    # tools) burns both prefill attempts and the third empty
+                    # gets zero recovery.  Resetting here treats each tool-
+                    # call success as a fresh start.
+                    if _had_prefill:
+                        self._thinking_prefill_retries = 0
+                        self._empty_content_retries = 0
 
                     messages.append(assistant_msg)
                     self._emit_interim_assistant_message(assistant_msg)
@@ -9917,16 +9946,23 @@ class AIAgent:
                             self._save_session_log(messages)
                             continue
 
-                        # ── Empty response retry (no reasoning) ──────
-                        # Model returned nothing — no content, no
-                        # structured reasoning, no tool calls.  Common
-                        # with open models (transient provider issues,
-                        # rate limits, sampling flukes).  Retry up to 3
-                        # times before attempting fallback.  Skip when
-                        # content has inline <think> tags (model chose
-                        # to reason, just no visible text).
-                        _truly_empty = not final_response.strip()
-                        if _truly_empty and not _has_structured and self._empty_content_retries < 3:
+                        # ── Empty response retry ──────────────────────
+                        # Model returned nothing usable.  Retry up to 3
+                        # times before attempting fallback.  This covers
+                        # both truly empty responses (no content, no
+                        # reasoning) AND reasoning-only responses after
+                        # prefill exhaustion — models like mimo-v2-pro
+                        # always populate reasoning fields via OpenRouter,
+                        # so the old `not _has_structured` guard blocked
+                        # retries for every reasoning model after prefill.
+                        _truly_empty = not self._strip_think_blocks(
+                            final_response
+                        ).strip()
+                        _prefill_exhausted = (
+                            _has_structured
+                            and self._thinking_prefill_retries >= 2
+                        )
+                        if _truly_empty and (not _has_structured or _prefill_exhausted) and self._empty_content_retries < 3:
                             self._empty_content_retries += 1
                             logger.warning(
                                 "Empty response (no content or reasoning) — "
