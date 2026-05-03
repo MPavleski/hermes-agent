@@ -621,6 +621,9 @@ AUTHOR_MAP = {
     "2114364329@qq.com": "cuyua9",
     "2557058999@qq.com": "Disaster-Terminator",
     "cine.dreamer.one@gmail.com": "LeonSGP43",
+    "zyprothh@gmail.com": "Zyproth",
+    "amitgaur@gmail.com": "amitgaur",
+    "albuquerque.abner@gmail.com": "mrbob-git",
     "leozeli@qq.com": "leozeli",
     "linlehao@cuhk.edu.cn": "LehaoLin",
     "liutong@isacas.ac.cn": "I3eg1nner",
@@ -679,6 +682,8 @@ AUTHOR_MAP = {
     "ztzheng@163.com": "chengoak",  # PR #17467
     "24110240104@m.fudan.edu.cn": "YuShu",  # co-author only
     "charliekerfoot@gmail.com": "CharlieKerfoot",  # PR #18951
+    # Debug share upload-time redaction (May 2026)
+    "dhuysamen@gmail.com": "GodsBoy",  # PR #19318
 }
 
 
