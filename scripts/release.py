@@ -68,6 +68,7 @@ AUTHOR_MAP = {
     "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
     "dejie.guo@gmail.com": "JayGwod",
     "maxence@groine.fr": "MaxyMoos",
+    "61830395+leprincep35700@users.noreply.github.com": "leprincep35700",
     # OpenViking viking_read salvage (April 2026)
     "hitesh@gmail.com": "htsh",
     "pty819@outlook.com": "pty819",
@@ -505,6 +506,10 @@ AUTHOR_MAP = {
     "michel.belleau@malaiwah.com": "malaiwah",
     "gnanasekaran.sekareee@gmail.com": "gnanam1990",
     "jz.pentest@gmail.com": "0xyg3n",
+    "7093928+0xyg3n@users.noreply.github.com": "0xyg3n",
+    "nftpoetrist@gmail.com": "nftpoetrist",  # PR #18982
+    "millerc79@users.noreply.github.com": "millerc79",  # PR #19033
+    "hermes@example.com": "shellybotmoyer",  # PR #18915 (bot-committed)
     "hypnosis.mda@gmail.com": "Hypn0sis",
     "ywt000818@gmail.com": "OwenYWT",
     "dhandhalyabhavik@gmail.com": "v1k22",
