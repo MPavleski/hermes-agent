@@ -1044,6 +1044,19 @@ function Install-Repository {
             $prevEAP = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
             try {
+                # This is a MANAGED checkout, not a repo the user edits. Git for
+                # Windows defaults to core.autocrlf=true, which renormalizes the
+                # repo's LF-only text files to CRLF in the working tree -- so
+                # tracked files (.envrc, AGENTS.md, agent/*.py, workflows, ...)
+                # show as locally modified even though nobody touched them. A
+                # bare `git checkout` then aborts with "Your local changes would
+                # be overwritten by checkout", which is exactly the failure GUI
+                # users hit on update. Two-part fix: (1) stop creating the dirt
+                # by pinning autocrlf=false on this clone, (2) discard any
+                # pre-existing dirt with a hard reset before the checkout. Safe
+                # because nothing here is user-authored.
+                git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+                git -c windows.appendAtomically=false reset --hard HEAD 2>$null
                 git -c windows.appendAtomically=false fetch origin
                 if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
                 # Precedence: Commit > Tag > Branch.  Commit and Tag check
@@ -1105,7 +1118,7 @@ function Install-Repository {
         Write-Info "Trying SSH clone..."
         $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
         try {
-            git -c windows.appendAtomically=false clone --branch $Branch --recurse-submodules $RepoUrlSsh $InstallDir
+            git -c windows.appendAtomically=false clone --branch $Branch $RepoUrlSsh $InstallDir
             if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
         } catch { }
         $env:GIT_SSH_COMMAND = $null
@@ -1114,7 +1127,7 @@ function Install-Repository {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
             Write-Info "SSH failed, trying HTTPS..."
             try {
-                git -c windows.appendAtomically=false clone --branch $Branch --recurse-submodules $RepoUrlHttps $InstallDir
+                git -c windows.appendAtomically=false clone --branch $Branch $RepoUrlHttps $InstallDir
                 if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
             } catch { }
         }
@@ -1178,6 +1191,11 @@ function Install-Repository {
     # Set per-repo config (harmless if it fails)
     Push-Location $InstallDir
     git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
+    # Pin autocrlf=false on the managed clone so git never renormalizes the
+    # repo's LF text files to CRLF in the working tree. Without this, the very
+    # next `hermes update` checkout aborts on a "dirty" tree the user never
+    # touched (see the update path above).
+    git -c windows.appendAtomically=false config core.autocrlf false 2>$null
 
     # Post-clone pin: when a clone (or ZIP-fallback init) just landed us on
     # $Branch's tip, honour the higher-precedence $Commit / $Tag by checking
@@ -1209,16 +1227,6 @@ function Install-Repository {
             $ErrorActionPreference = $prevEAP
         }
     }
-
-    # Ensure submodules are initialized and updated
-    Write-Info "Initializing submodules..."
-    git -c windows.appendAtomically=false submodule update --init --recursive 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn "Submodule init failed (terminal/RL tools may need manual setup)"
-    } else {
-        Write-Success "Submodules ready"
-    }
-    Pop-Location
 
     Write-Success "Repository ready"
 }
