@@ -307,6 +307,19 @@ def _billing_or_entitlement_message(
         ]
         return "\n".join(lines)
 
+    # Provider-agnostic billing URL derivation (OpenAI, DeepSeek, xAI, Groq,
+    # OpenRouter, …) so every text surface — CLI, gateway messaging, TUI
+    # transcript — shows the same actionable link, not just OpenRouter.
+    try:
+        from agent.billing_links import build_billing_block
+
+        _link = build_billing_block(provider=provider, base_url=base_url, model=model)
+        if _link.provider_label:
+            provider_label = _link.provider_label
+        billing_url = _link.billing_url
+    except Exception:
+        billing_url = None
+
     lines = [
         (
             f"{provider_label} reported that billing, credits, or account "
@@ -314,10 +327,22 @@ def _billing_or_entitlement_message(
         ),
         "Add credits or update billing with that provider, then retry.",
     ]
-    if base_url_host_matches(str(base_url or ""), "openrouter.ai"):
-        lines.append("OpenRouter credits: https://openrouter.ai/settings/credits")
+    if billing_url:
+        lines.append(f"{provider_label} billing: {billing_url}")
     lines.append("You can switch providers temporarily with /model <model> --provider <provider>.")
     return "\n".join(lines)
+
+
+def _billing_block_dict(provider, base_url, model, message="") -> Optional[dict]:
+    """Best-effort structured billing descriptor (None if billing_links is unavailable)."""
+    try:
+        from agent.billing_links import build_billing_block
+
+        return build_billing_block(
+            provider=provider, base_url=str(base_url), model=model, message=message
+        ).to_dict()
+    except Exception:
+        return None
 
 
 def _print_billing_or_entitlement_guidance(
@@ -2318,13 +2343,17 @@ def run_conversation(
                                     force=True,
                                 )
                             agent._cleanup_task_resources(effective_task_id)
-                            agent._persist_session(messages, conversation_history)
                             _final_response = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
                                 if _is_stub_stall
                                 else "Response truncated due to output length limit"
                             )
+                            # Prior successful tool batches (or injected tool
+                            # errors) can leave a tool-result tail; this path
+                            # never reaches finalize_turn (#48879 class).
+                            close_interrupted_tool_sequence(messages, _final_response)
+                            agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": _final_response,
                                 "messages": messages,
@@ -4284,6 +4313,31 @@ def run_conversation(
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
                         )
+                    # Billing walls are the common non-retryable abort: enrich
+                    # the result with the same structured recovery descriptor as
+                    # the max-retries path so every surface (CLI, TUI, desktop)
+                    # renders one consistent billing signal.
+                    if classified.reason == FailoverReason.billing:
+                        _ce_guidance = _billing_or_entitlement_message(
+                            capability="model access",
+                            provider=_provider,
+                            base_url=str(_base),
+                            model=_model,
+                        )
+                        _ce_final = f"Billing or credits exhausted: {_nonretryable_summary}"
+                        if _ce_guidance:
+                            _ce_final += f"\n\n{_ce_guidance}"
+                        _ce_block = _billing_block_dict(_provider, _base, _model, _ce_guidance)
+                        return {
+                            "final_response": _ce_final,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _nonretryable_summary,
+                            "failure_reason": classified.reason.value,
+                            "billing_block": _ce_block,
+                        }
                     return {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
@@ -4444,10 +4498,14 @@ def run_conversation(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
                     agent._persist_session(messages, conversation_history)
+                    _billing_block = None
                     if classified.reason == FailoverReason.billing:
                         _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
+                        # Structured recovery descriptor so every surface renders
+                        # the same link + label from one signal (see helper).
+                        _billing_block = _billing_block_dict(_provider, _base, _model, _billing_guidance)
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
@@ -4487,6 +4545,9 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        # Present only for billing walls: structured recovery
+                        # descriptor (provider, billing_url, is_nous, message).
+                        "billing_block": _billing_block,
                     }
 
                 # For rate limits, respect the Retry-After header if present
@@ -4965,8 +5026,13 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True)
                         agent._invalid_tool_retries = 0
-                        agent._persist_session(messages, conversation_history)
                         _final_response = f"Model generated invalid tool call: {invalid_preview}"
+                        # Prior <3 retries (or an earlier successful tool batch)
+                        # leave a tool-result tail. Closing it here matches
+                        # interrupt aborts (#48879 / #52592) so the next user
+                        # turn is not tool→user for strict providers.
+                        close_interrupted_tool_sequence(messages, _final_response)
+                        agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -5046,14 +5112,18 @@ def run_conversation(
                         )
                         agent._invalid_json_retries = 0
                         agent._cleanup_task_resources(effective_task_id)
+                        _final_response = "Response truncated due to output length limit"
+                        # Same tool-tail close as interrupt / invalid-tool
+                        # exhaustion — this path never reaches finalize_turn.
+                        close_interrupted_tool_sequence(messages, _final_response)
                         agent._persist_session(messages, conversation_history)
                         return {
-                            "final_response": "Response truncated due to output length limit",
+                            "final_response": _final_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": "Response truncated due to output length limit",
+                            "error": _final_response,
                         }
 
                     # Track retries for invalid JSON arguments
