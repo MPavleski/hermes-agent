@@ -40,7 +40,28 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
-from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+
+# ``agent.auxiliary_client`` pulls credential_pool → hermes_cli.auth → httpx
+# → rich (~50 ms cold); only vision handlers need it. Loaded lazily; both
+# names stay module attributes so tests can keep patching
+# ``tools.vision_tools.async_call_llm``. Truthy-skip: injected mocks win.
+async_call_llm: Any = None
+extract_content_or_reasoning: Any = None
+
+
+def _load_auxiliary_client() -> None:
+    global async_call_llm, extract_content_or_reasoning
+    if async_call_llm is None or extract_content_or_reasoning is None:
+        from agent.auxiliary_client import (
+            async_call_llm as _acl,
+            extract_content_or_reasoning as _ecr,
+        )
+        if async_call_llm is None:
+            async_call_llm = _acl
+        if extract_content_or_reasoning is None:
+            extract_content_or_reasoning = _ecr
+
+
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
@@ -382,6 +403,77 @@ def _is_retryable_download_error(error: Exception) -> bool:
     return True
 
 
+async def _stream_download_to_file(
+    client,
+    url: str,
+    destination: Path,
+    max_bytes: int,
+    *,
+    headers: dict,
+    media_label: str = "Image",
+) -> Path:
+    """Stream an HTTP download to *destination* via a temp file with a running size cap.
+
+    Uses ``client.stream("GET", ...)`` so the response body is never fully
+    buffered in memory — chunks are written to a temp file and the running
+    byte count is checked against *max_bytes* after each chunk.  On success
+    the temp file is atomically replaced onto *destination*; on failure the
+    temp file is deleted.
+
+    A ``Content-Length`` header, when present and parseable, is used for an
+    early rejection before any bytes are streamed, but the streaming cap is
+    the authoritative guard (servers can omit or lie about the header).
+    """
+    from utils import atomic_replace
+
+    async with client.stream("GET", url, headers=headers) as response:
+        response.raise_for_status()
+
+        # Early rejection via Content-Length when present and valid.
+        cl = response.headers.get("content-length")
+        if cl:
+            try:
+                declared_size = int(cl)
+            except ValueError:
+                declared_size = None
+            if declared_size is not None and declared_size > max_bytes:
+                raise ValueError(
+                    f"{media_label} too large ({declared_size} bytes, max {max_bytes})"
+                )
+
+        final_url = str(response.url)
+        blocked = check_website_access(final_url)
+        if blocked:
+            raise PermissionError(blocked["message"])
+
+        tmp_destination = destination.with_name(
+            f".{destination.name}.{uuid.uuid4().hex}.tmp"
+        )
+        bytes_written = 0
+        try:
+            with tmp_destination.open("wb") as f:
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    bytes_written += len(chunk)
+                    if bytes_written > max_bytes:
+                        raise ValueError(
+                            f"{media_label} too large ({bytes_written} bytes, max {max_bytes})"
+                        )
+                    f.write(chunk)
+            atomic_replace(tmp_destination, destination)
+        except Exception:
+            try:
+                tmp_destination.unlink(missing_ok=True)
+            except OSError:
+                logger.debug(
+                    "Could not delete partial download: %s", tmp_destination, exc_info=True
+                )
+            raise
+
+    return destination
+
+
 async def _download_image(image_url: str, destination: Path, max_retries: int = 3) -> Path:
     """
     Download an image from a URL to a local destination (async) with retry logic.
@@ -426,43 +518,28 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
 
             from tools.url_safety import create_ssrf_safe_async_client
 
-            # Download the image with appropriate headers using async httpx
-            # Enable follow_redirects to handle image CDNs that redirect (e.g., Imgur, Picsum)
+            # Download the image with appropriate headers using async httpx.
+            # Enable follow_redirects to handle image CDNs that redirect (e.g., Imgur, Picsum).
             # SSRF: the client validates DNS at TCP connect time; event_hooks
             # validate each redirect target against private IP ranges.
+            # Streaming: body is written chunk-by-chunk to a temp file so the
+            # size cap bounds memory, not just disk.
             async with create_ssrf_safe_async_client(
                 timeout=_VISION_DOWNLOAD_TIMEOUT,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
             ) as client:
-                response = await client.get(
+                await _stream_download_to_file(
+                    client,
                     image_url,
+                    destination,
+                    _VISION_MAX_DOWNLOAD_BYTES,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                         "Accept": "image/*,*/*;q=0.8",
                     },
+                    media_label="Image",
                 )
-                response.raise_for_status()
-
-                # Reject overly large images early via Content-Length header.
-                cl = response.headers.get("content-length")
-                if cl and int(cl) > _VISION_MAX_DOWNLOAD_BYTES:
-                    raise ValueError(
-                        f"Image too large ({int(cl)} bytes, max {_VISION_MAX_DOWNLOAD_BYTES})"
-                    )
-
-                final_url = str(response.url)
-                blocked = check_website_access(final_url)
-                if blocked:
-                    raise PermissionError(blocked["message"])
-                
-                # Save the image content (double-check actual size)
-                body = response.content
-                if len(body) > _VISION_MAX_DOWNLOAD_BYTES:
-                    raise ValueError(
-                        f"Image too large ({len(body)} bytes, max {_VISION_MAX_DOWNLOAD_BYTES})"
-                    )
-                destination.write_bytes(body)
             
             return destination
         except Exception as e:
@@ -1251,6 +1328,7 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+        _load_auxiliary_client()
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
             response = await async_call_llm(**call_kwargs)
@@ -1585,32 +1663,17 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
             ) as client:
-                response = await client.get(
+                await _stream_download_to_file(
+                    client,
                     video_url,
+                    destination,
+                    _MAX_VIDEO_BASE64_BYTES,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                         "Accept": "video/*,*/*;q=0.8",
                     },
+                    media_label="Video",
                 )
-                response.raise_for_status()
-
-                cl = response.headers.get("content-length")
-                if cl and int(cl) > _MAX_VIDEO_BASE64_BYTES:
-                    raise ValueError(
-                        f"Video too large ({int(cl)} bytes, max {_MAX_VIDEO_BASE64_BYTES})"
-                    )
-
-                final_url = str(response.url)
-                blocked = check_website_access(final_url)
-                if blocked:
-                    raise PermissionError(blocked["message"])
-
-                body = response.content
-                if len(body) > _MAX_VIDEO_BASE64_BYTES:
-                    raise ValueError(
-                        f"Video too large ({len(body)} bytes, max {_MAX_VIDEO_BASE64_BYTES})"
-                    )
-                destination.write_bytes(body)
 
             return destination
         except Exception as e:
@@ -1758,6 +1821,7 @@ async def video_analyze_tool(
         if model:
             call_kwargs["model"] = model
 
+        _load_auxiliary_client()
         response = await async_call_llm(**call_kwargs)
         analysis = extract_content_or_reasoning(response)
 
